@@ -25,4 +25,5 @@ class BrowserState {
     var rendererGone by mutableStateOf(false)
     var pendingExternalUrl by mutableStateOf<String?>(null)
     var message by mutableStateOf<String?>(null)
+    var desktopSite by mutableStateOf(false)
 }
