@@ -1,129 +1,214 @@
 package com.qunverio.browser
 
-import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
-import android.content.pm.ApplicationInfo
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
-import android.view.ViewGroup
 import android.webkit.CookieManager
-import android.webkit.WebSettings
-import android.webkit.WebView
+import android.webkit.WebStorage
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.qunverio.browser.adblock.FilterEngine
+import com.qunverio.browser.adblock.FilterManager
+import com.qunverio.browser.adblock.hostInSet
+import com.qunverio.browser.data.BookmarkStore
+import com.qunverio.browser.data.HistoryStore
+import com.qunverio.browser.data.SettingsStore
 import com.qunverio.browser.navigation.ParsedInput
 import com.qunverio.browser.navigation.UrlInputParser
 import com.qunverio.browser.ui.BrowserActions
 import com.qunverio.browser.ui.BrowserScreen
+import com.qunverio.browser.ui.LibraryScreen
 import com.qunverio.browser.ui.QunverioTheme
-import com.qunverio.browser.web.BrowserChromeClient
-import com.qunverio.browser.web.BrowserState
-import com.qunverio.browser.web.BrowserWebViewClient
+import com.qunverio.browser.ui.SettingsScreen
+import com.qunverio.browser.ui.TabSwitcherScreen
 import com.qunverio.browser.web.SecurityState
+import com.qunverio.browser.web.TabManager
+import com.qunverio.browser.web.hostOf
 import com.qunverio.browser.web.securityFor
+import java.io.File
+
+private enum class Screen { BROWSER, TABS, SETTINGS, LIBRARY }
 
 class BrowserActivity : ComponentActivity() {
 
-    private val state = BrowserState()
-    private lateinit var webView: WebView
-    private lateinit var mobileUserAgent: String
+    private lateinit var settings: SettingsStore
+    private lateinit var engine: FilterEngine
+    private lateinit var filters: FilterManager
+    private lateinit var history: HistoryStore
+    private lateinit var bookmarks: BookmarkStore
+    private lateinit var manager: TabManager
+
+    private var screen by mutableStateOf(Screen.BROWSER)
+    private var libraryTab by mutableIntStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        webView = createWebView()
-        mobileUserAgent = webView.settings.userAgentString
-        restore(savedInstanceState)
+        settings = SettingsStore(this)
+        engine = FilterEngine()
+        filters = FilterManager(this, engine, settings)
+        history = HistoryStore(File(filesDir, "history.json"))
+        bookmarks = BookmarkStore(File(filesDir, "bookmarks.json"))
+        manager = TabManager(this, settings, engine, history)
+
+        filters.loadAsync()
+        filters.updateIfStale()
+        manager.restoreOrCreate()
 
         val actions = BrowserActions(
             onSubmit = ::submit,
-            onBack = { if (!state.rendererGone && webView.canGoBack()) webView.goBack() },
-            onForward = { if (!state.rendererGone && webView.canGoForward()) webView.goForward() },
+            onBack = ::goBack,
+            onForward = {
+                val tab = manager.current
+                val wv = tab?.webView
+                if (tab != null && wv != null && !tab.state.rendererGone && wv.canGoForward()) wv.goForward()
+            },
             onHome = ::goHome,
             onReloadOrStop = ::reloadOrStop,
             onRetry = ::retry,
             onShare = ::shareLink,
             onCopy = ::copyLink,
-            onToggleDesktop = { setDesktopSite(!state.desktopSite, reload = true) },
+            onToggleDesktop = {
+                manager.current?.let { manager.setDesktop(it, !it.state.desktopSite) }
+            },
+            onToggleSiteAdBlock = ::toggleSiteAdBlock,
+            onToggleBookmark = {
+                val state = manager.current?.state
+                val url = state?.pageUrl
+                if (state != null && url != null) {
+                    val wasBookmarked = bookmarks.contains(url)
+                    bookmarks.toggle(url, state.title)
+                    state.message = if (wasBookmarked) "Bookmark removed" else "Bookmark added"
+                }
+            },
+            onNewTab = { manager.newTab(null) },
+            onOpenTabs = { screen = Screen.TABS },
+            onOpenSettings = { screen = Screen.SETTINGS },
+            onOpenBookmarks = { libraryTab = 0; screen = Screen.LIBRARY },
+            onOpenHistory = { libraryTab = 1; screen = Screen.LIBRARY },
             onConfirmExternal = ::openExternal,
-            onDismissExternal = { state.pendingExternalUrl = null },
+            onDismissExternal = { manager.current?.state?.pendingExternalUrl = null },
         )
 
         setContent {
-            QunverioTheme {
-                BrowserScreen(state = state, webView = webView, actions = actions)
+            val dark = when (settings.themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> isSystemInDarkTheme()
+            }
+            DisposableEffect(dark) {
+                enableEdgeToEdge(
+                    statusBarStyle = if (dark) {
+                        SystemBarStyle.dark(Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+                    },
+                    navigationBarStyle = if (dark) {
+                        SystemBarStyle.dark(Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+                    },
+                )
+                onDispose {}
+            }
+
+            QunverioTheme(darkTheme = dark) {
+                when (screen) {
+                    Screen.BROWSER -> BrowserScreen(
+                        manager = manager,
+                        settings = settings,
+                        bookmarks = bookmarks,
+                        actions = actions,
+                    )
+                    Screen.TABS -> {
+                        BackHandler { screen = Screen.BROWSER }
+                        TabSwitcherScreen(
+                            manager = manager,
+                            onSelect = { id -> manager.select(id); screen = Screen.BROWSER },
+                            onClose = { id -> manager.close(id) },
+                            onNewTab = { manager.newTab(null); screen = Screen.BROWSER },
+                            onCloseAll = { manager.closeAll(); screen = Screen.BROWSER },
+                            onBack = { screen = Screen.BROWSER },
+                        )
+                    }
+                    Screen.SETTINGS -> {
+                        BackHandler { screen = Screen.BROWSER }
+                        SettingsScreen(
+                            settings = settings,
+                            filters = filters,
+                            onBack = { screen = Screen.BROWSER },
+                            onChanged = { manager.applyAll() },
+                            onClearData = ::clearBrowsingData,
+                        )
+                    }
+                    Screen.LIBRARY -> {
+                        BackHandler { screen = Screen.BROWSER }
+                        LibraryScreen(
+                            initialTab = libraryTab,
+                            bookmarks = bookmarks,
+                            history = history,
+                            onOpen = { url -> navigateTo(url); screen = Screen.BROWSER },
+                            onBack = { screen = Screen.BROWSER },
+                        )
+                    }
+                }
             }
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(): WebView {
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-            WebView.setWebContentsDebuggingEnabled(true)
-        }
-        return WebView(this).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            )
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                // No local file access, no JavaScript bridges.
-                allowFileAccess = false
-                allowContentAccess = false
-                mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                safeBrowsingEnabled = true
-                setSupportZoom(true)
-                builtInZoomControls = true
-                displayZoomControls = false
-                useWideViewPort = true
-                loadWithOverviewMode = true
-            }
-            CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
-            webViewClient = BrowserWebViewClient(state)
-            webChromeClient = BrowserChromeClient(state)
-        }
-    }
-
-    private fun restore(saved: Bundle?) {
-        if (saved == null) return
-        if (saved.getBoolean(KEY_DESKTOP)) setDesktopSite(true, reload = false)
-        val url = saved.getString(KEY_URL)
-        state.pageUrl = url
-        state.security = url?.let { securityFor(it) } ?: state.security
-        val webState = saved.getBundle(KEY_WEB)
-        val restored = webState != null && webView.restoreState(webState) != null
-        if (!restored && url != null) webView.loadUrl(url)
-    }
-
+    // ---- navigation ----
     private fun submit(raw: String) {
-        when (val result = UrlInputParser.parse(raw)) {
+        when (val result = UrlInputParser.parse(raw, settings.searchTemplate)) {
             is ParsedInput.Navigate -> navigateTo(result.url)
             is ParsedInput.Search -> navigateTo(result.url)
-            is ParsedInput.Rejected -> state.message = result.reason
+            is ParsedInput.Rejected -> manager.current?.state?.message = result.reason
         }
     }
 
     private fun navigateTo(url: String) {
+        val tab = manager.current ?: return
+        val state = tab.state
         state.pendingExternalUrl = null
         state.pageUrl = url
         state.security = securityFor(url)
+        tab.pendingUrl = null
+        tab.savedState = null
         if (state.rendererGone) {
-            recreate() // the old WebView is unusable after its renderer died
+            manager.reviveTab(tab) // rebuilds the WebView and loads state.pageUrl
             return
         }
         state.errorMessage = null
-        webView.loadUrl(url)
+        manager.ensureWebView(tab).loadUrl(url)
+    }
+
+    private fun goBack() {
+        val tab = manager.current ?: return
+        val wv = tab.webView
+        if (wv != null && !tab.state.rendererGone && wv.canGoBack()) {
+            wv.goBack()
+        } else if (manager.tabs.size > 1) {
+            manager.close(tab.id)
+        }
     }
 
     private fun goHome() {
-        if (!state.rendererGone) webView.stopLoading()
+        val tab = manager.current ?: return
+        val state = tab.state
+        if (!state.rendererGone) tab.webView?.stopLoading()
         state.isLoading = false
         state.errorMessage = null
         state.pageUrl = null
@@ -131,42 +216,42 @@ class BrowserActivity : ComponentActivity() {
     }
 
     private fun reloadOrStop() {
+        val tab = manager.current ?: return
+        val state = tab.state
         if (state.rendererGone) return
         when {
             state.isLoading -> {
-                webView.stopLoading()
+                tab.webView?.stopLoading()
                 state.isLoading = false
             }
             state.errorMessage != null -> retry()
-            state.pageUrl != null -> webView.reload()
+            state.pageUrl != null -> tab.webView?.reload()
         }
     }
 
     private fun retry() {
+        val tab = manager.current ?: return
+        val state = tab.state
         if (state.rendererGone) {
-            recreate()
+            manager.reviveTab(tab)
             return
         }
         val url = state.pageUrl ?: return
         state.errorMessage = null
-        webView.loadUrl(url)
+        manager.ensureWebView(tab).loadUrl(url)
     }
 
-    private fun setDesktopSite(enabled: Boolean, reload: Boolean) {
-        state.desktopSite = enabled
-        webView.settings.userAgentString = if (enabled) desktopUserAgent() else mobileUserAgent
-        if (reload && !state.rendererGone && state.pageUrl != null && state.errorMessage == null) {
-            webView.reload()
-        }
-    }
-
-    private fun desktopUserAgent(): String {
-        val chrome = Regex("Chrome/([\\d.]+)").find(mobileUserAgent)?.groupValues?.get(1) ?: "120.0.0.0"
-        return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chrome Safari/537.36"
+    // ---- menu actions ----
+    private fun toggleSiteAdBlock() {
+        val tab = manager.current ?: return
+        val host = hostOf(tab.state.pageUrl) ?: return
+        val currentlyBlocking = !hostInSet(settings.adBlockAllowedHosts, host)
+        settings.setSiteAdBlock(host, enabled = !currentlyBlocking)
+        if (!tab.state.rendererGone) tab.webView?.reload()
     }
 
     private fun shareLink() {
-        val url = state.pageUrl ?: return
+        val url = manager.current?.state?.pageUrl ?: return
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_TEXT, url)
@@ -175,6 +260,7 @@ class BrowserActivity : ComponentActivity() {
     }
 
     private fun copyLink() {
+        val state = manager.current?.state ?: return
         val url = state.pageUrl ?: return
         val clipboard = getSystemService(ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("Link", url))
@@ -182,6 +268,7 @@ class BrowserActivity : ComponentActivity() {
     }
 
     private fun openExternal(url: String) {
+        val state = manager.current?.state ?: return
         state.pendingExternalUrl = null
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
         try {
@@ -191,36 +278,30 @@ class BrowserActivity : ComponentActivity() {
         }
     }
 
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        outState.putBoolean(KEY_DESKTOP, state.desktopSite)
-        state.pageUrl?.let { outState.putString(KEY_URL, it) }
-        if (!state.rendererGone) {
-            val web = Bundle()
-            webView.saveState(web)
-            outState.putBundle(KEY_WEB, web)
-        }
+    private fun clearBrowsingData() {
+        history.clear()
+        manager.clearCaches()
+        val cookies = CookieManager.getInstance()
+        cookies.removeAllCookies(null)
+        cookies.flush()
+        WebStorage.getInstance().deleteAllData()
+        manager.current?.state?.message = "Browsing data cleared"
     }
 
+    // ---- lifecycle ----
     override fun onResume() {
         super.onResume()
-        webView.onResume()
+        manager.current?.webView?.onResume()
     }
 
     override fun onPause() {
-        webView.onPause()
+        manager.current?.webView?.onPause()
+        manager.saveTabs()
         super.onPause()
     }
 
     override fun onDestroy() {
-        (webView.parent as? ViewGroup)?.removeView(webView)
-        webView.destroy()
+        manager.destroyAll()
         super.onDestroy()
-    }
-
-    private companion object {
-        const val KEY_WEB = "web_state"
-        const val KEY_URL = "page_url"
-        const val KEY_DESKTOP = "desktop_site"
     }
 }

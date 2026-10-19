@@ -1,5 +1,6 @@
 package com.qunverio.browser.web
 
+import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -13,9 +14,12 @@ fun securityFor(url: String): SecurityState = when {
     else -> SecurityState.NONE
 }
 
-/** UI-observable state of the single browser view (Milestone 1: one page, no tabs yet). */
+fun hostOf(url: String?): String? = if (url == null) null else Uri.parse(url).host?.lowercase()
+
+/** UI-observable state of one tab. */
 class BrowserState {
     var pageUrl by mutableStateOf<String?>(null)
+    var title by mutableStateOf("")
     var progress by mutableIntStateOf(0)
     var isLoading by mutableStateOf(false)
     var canGoBack by mutableStateOf(false)
@@ -26,4 +30,5 @@ class BrowserState {
     var pendingExternalUrl by mutableStateOf<String?>(null)
     var message by mutableStateOf<String?>(null)
     var desktopSite by mutableStateOf(false)
+    var blockedCount by mutableIntStateOf(0)
 }

@@ -2,17 +2,65 @@ package com.qunverio.browser.web
 
 import android.graphics.Bitmap
 import android.net.http.SslError
+import android.os.Handler
+import android.os.Looper
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.qunverio.browser.adblock.FilterEngine
+import com.qunverio.browser.adblock.hostInSet
+import com.qunverio.browser.data.SettingsStore
 import com.qunverio.browser.navigation.LinkDecision
 import com.qunverio.browser.navigation.LinkPolicy
+import java.io.ByteArrayInputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
-class BrowserWebViewClient(private val state: BrowserState) : WebViewClient() {
+class BrowserWebViewClient(
+    private val state: BrowserState,
+    private val engine: FilterEngine,
+    private val settings: SettingsStore,
+    private val onVisited: (url: String, title: String) -> Unit,
+) : WebViewClient() {
 
+    // Written from request threads and the UI thread, so it must be volatile.
+    @Volatile private var pageHost: String? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val pendingBlocked = AtomicInteger(0)
+    private val flushScheduled = AtomicBoolean(false)
+
+    // ---- ad / tracker blocking (runs on WebView background threads) ----
+    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+        val host = request.url.host?.lowercase() ?: return null
+        if (request.isForMainFrame) {
+            pageHost = host
+            return null // navigations are never blocked
+        }
+        if (!settings.adBlockEnabled) return null
+        val page = pageHost
+        if (page != null && hostInSet(settings.adBlockAllowedHosts, page)) return null
+        if (engine.shouldBlock(host, page)) {
+            recordBlocked()
+            return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+        }
+        return null
+    }
+
+    private fun recordBlocked() {
+        pendingBlocked.incrementAndGet()
+        if (flushScheduled.compareAndSet(false, true)) {
+            mainHandler.postDelayed({
+                flushScheduled.set(false)
+                state.blockedCount += pendingBlocked.getAndSet(0)
+            }, 300)
+        }
+    }
+
+    // ---- navigation policy ----
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val uri = request.url
         return when (LinkPolicy.decide(uri.scheme, uri.toString(), request.hasGesture())) {
@@ -33,7 +81,11 @@ class BrowserWebViewClient(private val state: BrowserState) : WebViewClient() {
     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
         state.errorMessage = null
         state.isLoading = true
-        url?.let { updateUrl(it) }
+        state.blockedCount = 0
+        url?.let {
+            pageHost = hostOf(it)
+            updateUrl(it)
+        }
         syncHistory(view)
     }
 
@@ -44,7 +96,14 @@ class BrowserWebViewClient(private val state: BrowserState) : WebViewClient() {
 
     override fun onPageFinished(view: WebView, url: String?) {
         state.isLoading = false
-        if (state.errorMessage == null) url?.let { updateUrl(it) }
+        if (state.errorMessage == null) {
+            url?.let { updateUrl(it) }
+            val title = view.title.orEmpty()
+            if (title.isNotBlank()) state.title = title
+            if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                onVisited(url, title)
+            }
+        }
         syncHistory(view)
     }
 

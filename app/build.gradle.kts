@@ -11,8 +11,8 @@ android {
         applicationId = "com.qunverio.browser"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -32,6 +32,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         // Must match Kotlin 1.9.24

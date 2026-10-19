@@ -1,9 +1,9 @@
 package com.qunverio.browser.ui
 
-import android.webkit.WebView
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,6 +52,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -68,8 +69,14 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.qunverio.browser.adblock.hostInSet
+import com.qunverio.browser.data.BookmarkStore
+import com.qunverio.browser.data.SettingsStore
 import com.qunverio.browser.web.BrowserState
+import com.qunverio.browser.web.BrowserTab
 import com.qunverio.browser.web.SecurityState
+import com.qunverio.browser.web.TabManager
+import com.qunverio.browser.web.hostOf
 
 class BrowserActions(
     val onSubmit: (String) -> Unit,
@@ -81,15 +88,30 @@ class BrowserActions(
     val onShare: () -> Unit,
     val onCopy: () -> Unit,
     val onToggleDesktop: () -> Unit,
+    val onToggleSiteAdBlock: () -> Unit,
+    val onToggleBookmark: () -> Unit,
+    val onNewTab: () -> Unit,
+    val onOpenTabs: () -> Unit,
+    val onOpenSettings: () -> Unit,
+    val onOpenBookmarks: () -> Unit,
+    val onOpenHistory: () -> Unit,
     val onConfirmExternal: (String) -> Unit,
     val onDismissExternal: () -> Unit,
 )
 
 @Composable
-fun BrowserScreen(state: BrowserState, webView: WebView, actions: BrowserActions) {
+fun BrowserScreen(
+    manager: TabManager,
+    settings: SettingsStore,
+    bookmarks: BookmarkStore,
+    actions: BrowserActions,
+) {
+    val tab = manager.current ?: return
+    val state = tab.state
     val snackbarHostState = remember { SnackbarHostState() }
 
-    BackHandler(enabled = state.canGoBack) { actions.onBack() }
+    // Back: step back in the page, else close the tab (if there are others), else leave the app.
+    BackHandler(enabled = state.canGoBack || manager.tabs.size > 1) { actions.onBack() }
 
     LaunchedEffect(state.message) {
         val text = state.message
@@ -108,14 +130,19 @@ fun BrowserScreen(state: BrowserState, webView: WebView, actions: BrowserActions
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            TopBar(state = state, actions = actions)
+            TopBar(tab = tab, settings = settings, bookmarks = bookmarks, actions = actions)
 
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth(),
             ) {
-                AndroidView(factory = { webView }, modifier = Modifier.fillMaxSize())
+                key(tab.id, tab.generation) {
+                    AndroidView(
+                        factory = { manager.viewFor(tab) },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
 
                 val error = state.errorMessage
                 if (error != null) {
@@ -125,7 +152,7 @@ fun BrowserScreen(state: BrowserState, webView: WebView, actions: BrowserActions
                 }
             }
 
-            BottomBar(state = state, actions = actions)
+            BottomBar(state = state, tabCount = manager.tabs.size, actions = actions)
         }
     }
 
@@ -145,9 +172,18 @@ fun BrowserScreen(state: BrowserState, webView: WebView, actions: BrowserActions
 }
 
 @Composable
-private fun TopBar(state: BrowserState, actions: BrowserActions) {
+private fun TopBar(
+    tab: BrowserTab,
+    settings: SettingsStore,
+    bookmarks: BookmarkStore,
+    actions: BrowserActions,
+) {
+    val state = tab.state
     var menuOpen by remember { mutableStateOf(false) }
     val hasPage = state.pageUrl != null
+    val host = hostOf(state.pageUrl)
+    val siteBlocking = host != null && !hostInSet(settings.adBlockAllowedHosts, host)
+    val bookmarked = bookmarks.contains(state.pageUrl)
 
     Column {
         Row(
@@ -156,7 +192,9 @@ private fun TopBar(state: BrowserState, actions: BrowserActions) {
                 .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            AddressPill(state = state, onSubmit = actions.onSubmit, modifier = Modifier.weight(1f))
+            key(tab.id) {
+                AddressPill(state = state, onSubmit = actions.onSubmit, modifier = Modifier.weight(1f))
+            }
 
             Box {
                 IconButton(onClick = { menuOpen = true }) {
@@ -164,28 +202,54 @@ private fun TopBar(state: BrowserState, actions: BrowserActions) {
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(
+                        text = { Text("New tab") },
+                        onClick = { menuOpen = false; actions.onNewTab() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Bookmarks") },
+                        onClick = { menuOpen = false; actions.onOpenBookmarks() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("History") },
+                        onClick = { menuOpen = false; actions.onOpenHistory() },
+                    )
+                    HorizontalDivider()
+                    DropdownMenuItem(
+                        text = { Text(if (bookmarked) "Remove bookmark" else "Add bookmark") },
+                        enabled = hasPage,
+                        onClick = { menuOpen = false; actions.onToggleBookmark() },
+                    )
+                    DropdownMenuItem(
                         text = { Text("Share link") },
                         enabled = hasPage,
-                        onClick = {
-                            menuOpen = false
-                            actions.onShare()
-                        },
+                        onClick = { menuOpen = false; actions.onShare() },
                     )
                     DropdownMenuItem(
                         text = { Text("Copy link") },
                         enabled = hasPage,
-                        onClick = {
-                            menuOpen = false
-                            actions.onCopy()
-                        },
+                        onClick = { menuOpen = false; actions.onCopy() },
                     )
+                    HorizontalDivider()
                     DropdownMenuItem(
                         text = { Text("Desktop site") },
                         trailingIcon = { Checkbox(checked = state.desktopSite, onCheckedChange = null) },
-                        onClick = {
-                            menuOpen = false
-                            actions.onToggleDesktop()
-                        },
+                        onClick = { menuOpen = false; actions.onToggleDesktop() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Block ads on this site") },
+                        enabled = host != null && settings.adBlockEnabled,
+                        trailingIcon = { Checkbox(checked = siteBlocking, onCheckedChange = null) },
+                        onClick = { menuOpen = false; actions.onToggleSiteAdBlock() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Blocked on this page: ${state.blockedCount}") },
+                        enabled = false,
+                        onClick = {},
+                    )
+                    HorizontalDivider()
+                    DropdownMenuItem(
+                        text = { Text("Settings") },
+                        onClick = { menuOpen = false; actions.onOpenSettings() },
                     )
                 }
             }
@@ -290,7 +354,7 @@ private fun SecurityIcon(security: SecurityState) {
 }
 
 @Composable
-private fun BottomBar(state: BrowserState, actions: BrowserActions) {
+private fun BottomBar(state: BrowserState, tabCount: Int, actions: BrowserActions) {
     Column {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Row(
@@ -298,6 +362,7 @@ private fun BottomBar(state: BrowserState, actions: BrowserActions) {
                 .fillMaxWidth()
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = actions.onBack, enabled = state.canGoBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -313,6 +378,19 @@ private fun BottomBar(state: BrowserState, actions: BrowserActions) {
                     Icon(Icons.Filled.Close, contentDescription = "Stop loading")
                 } else {
                     Icon(Icons.Filled.Refresh, contentDescription = "Reload")
+                }
+            }
+            IconButton(onClick = actions.onOpenTabs) {
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .border(2.dp, MaterialTheme.colorScheme.onSurface, RoundedCornerShape(7.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        tabCount.toString(),
+                        style = MaterialTheme.typography.labelMedium,
+                    )
                 }
             }
         }

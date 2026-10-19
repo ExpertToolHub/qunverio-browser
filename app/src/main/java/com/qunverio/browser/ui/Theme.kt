@@ -1,13 +1,11 @@
 package com.qunverio.browser.ui
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
-// Light: tinted top/bottom bars, white address pill with a clearly visible border.
 private val LightColors = lightColorScheme(
     primary = Color(0xFF4F46E5),
     onPrimary = Color.White,
@@ -25,7 +23,6 @@ private val LightColors = lightColorScheme(
     onError = Color.White,
 )
 
-// Dark: deep indigo bars, lighter pill so it stands out.
 private val DarkColors = darkColorScheme(
     primary = Color(0xFF9BA3FF),
     onPrimary = Color(0xFF14176B),
@@ -44,9 +41,9 @@ private val DarkColors = darkColorScheme(
 )
 
 @Composable
-fun QunverioTheme(content: @Composable () -> Unit) {
+fun QunverioTheme(darkTheme: Boolean, content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        colorScheme = if (darkTheme) DarkColors else LightColors,
         content = content,
     )
 }
